@@ -19,12 +19,13 @@ const STATUS_TEXT: Record<string, string> = {
 export function SettingsView() {
   const sync = useSyncState()
   const counts = useLiveQuery(async () => {
-    const [observations, pending, photos] = await Promise.all([
+    const [observations, sheets, pending, photos] = await Promise.all([
       db.observations.filter((o) => !o.deleted).count(),
-      db.observations.where('dirty').equals(1).count(),
+      db.sheets.filter((s) => !s.deleted).count(),
+      db.countPending(),
       db.photos.count(),
     ])
-    return { observations, pending, photos }
+    return { observations, sheets, pending, photos }
   }, [])
   const [usage, setUsage] = useState<string | null>(null)
   const [clientId, setClientId] = useState(readLocalClientId())
@@ -43,8 +44,8 @@ export function SettingsView() {
       <section className="panel">
         <h2>Google Drive</h2>
         <p>
-          Tus registros y fotos se guardan en este dispositivo y se copian en la carpeta <strong>Formidex</strong> de tu Google Drive, así
-          los ves igual en el móvil y en el ordenador.
+          Tus registros, fichas de cría y fotos se guardan en este dispositivo y se copian en la carpeta <strong>Formidex</strong> de tu
+          Google Drive, así los ves igual en el móvil y en el ordenador.
         </p>
         <p className={`status-line status-${sync.status}`}>
           {STATUS_TEXT[sync.status]}
@@ -94,8 +95,9 @@ export function SettingsView() {
         {counts && (
           <ul className="facts">
             <li>
-              {counts.observations} {counts.observations === 1 ? 'registro' : 'registros'} y {counts.photos}{' '}
-              {counts.photos === 1 ? 'foto' : 'fotos'} guardados aquí
+              {counts.observations} {counts.observations === 1 ? 'registro' : 'registros'}, {counts.sheets}{' '}
+              {counts.sheets === 1 ? 'ficha de cría' : 'fichas de cría'} y {counts.photos} {counts.photos === 1 ? 'foto' : 'fotos'}{' '}
+              guardados aquí
             </li>
             <li>
               {counts.pending === 0

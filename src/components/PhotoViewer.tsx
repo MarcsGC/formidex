@@ -28,10 +28,15 @@ export function PhotoViewer({ blob, photoId, onClose }: PhotoViewerProps) {
     }
   }, [blob, photoId])
 
+  // Escape cierra solo el visor, no el formulario que hay debajo.
   useEffect(() => {
-    const onKey = (event: KeyboardEvent) => event.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.stopPropagation()
+      onClose()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
   }, [onClose])
 
   return (

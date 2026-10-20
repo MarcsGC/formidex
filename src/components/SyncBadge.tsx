@@ -5,7 +5,7 @@ import { useSyncState } from './useSyncState'
 
 export function SyncBadge({ onOpenSettings }: { onOpenSettings: () => void }) {
   const sync = useSyncState()
-  const pending = useLiveQuery(() => db.observations.where('dirty').equals(1).count(), []) ?? 0
+  const pending = useLiveQuery(() => db.countPending(), []) ?? 0
 
   let label: string
   let tone: 'ok' | 'busy' | 'warn' | 'off'

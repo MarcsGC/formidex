@@ -7,6 +7,10 @@ interface TaxonFieldsProps {
   genus: string
   species: string
   onChange: (genus: string, species: string) => void
+  /** Hasta dónde es obligatorio (en las fichas de género y de especie). */
+  required?: 'genus' | 'species'
+  /** Las fichas de género no llevan especie. */
+  genusOnly?: boolean
 }
 
 interface KnownNames {
@@ -14,7 +18,7 @@ interface KnownNames {
   species: Map<string, string[]>
 }
 
-export function TaxonFields({ genus, species, onChange }: TaxonFieldsProps) {
+export function TaxonFields({ genus, species, onChange, required, genusOnly = false }: TaxonFieldsProps) {
   const genusListId = useId()
   const speciesListId = useId()
   const known = useLiveQuery(loadKnownNames, [])
@@ -54,11 +58,11 @@ export function TaxonFields({ genus, species, onChange }: TaxonFieldsProps) {
   // Si se escribe el nombre completo en el campo del género, se separa en los dos campos.
   function splitBinomial() {
     const parts = genus.trim().split(/\s+/)
-    if (parts.length >= 2 && !species.trim()) onChange(parts[0], parts.slice(1).join(' '))
+    if (!genusOnly && parts.length >= 2 && !species.trim()) onChange(parts[0], parts.slice(1).join(' '))
   }
 
   return (
-    <div className="taxon-fields">
+    <div className={`taxon-fields ${genusOnly ? 'taxon-fields-single' : ''}`}>
       <label className="field">
         <span className="field-label">Género</span>
         <input
@@ -66,7 +70,7 @@ export function TaxonFields({ genus, species, onChange }: TaxonFieldsProps) {
           value={genus}
           onChange={(e) => onChange(e.target.value, e.target.value.trim() ? species : '')}
           onBlur={splitBinomial}
-          placeholder="Opcional, p. ej. Messor"
+          placeholder={required ? 'p. ej. Messor' : 'Opcional, p. ej. Messor'}
           autoCapitalize="words"
           autoCorrect="off"
           spellCheck={false}
@@ -78,40 +82,45 @@ export function TaxonFields({ genus, species, onChange }: TaxonFieldsProps) {
           ))}
         </datalist>
       </label>
-      <label className="field">
-        <span className="field-label">Especie</span>
-        <input
-          list={speciesListId}
-          value={species}
-          onChange={(e) => onChange(genus, e.target.value)}
-          disabled={!hasGenus}
-          placeholder={hasGenus ? 'Opcional, p. ej. barbarus' : 'Primero el género'}
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-          autoComplete="off"
-        />
-        <datalist id={speciesListId}>
-          {(hasGenus ? speciesOptions : []).map((name) => (
-            <option key={name} value={name} />
-          ))}
-        </datalist>
-      </label>
+      {!genusOnly && (
+        <label className="field">
+          <span className="field-label">Especie</span>
+          <input
+            list={speciesListId}
+            value={species}
+            onChange={(e) => onChange(genus, e.target.value)}
+            disabled={!hasGenus}
+            placeholder={hasGenus ? (required === 'species' ? 'p. ej. barbarus' : 'Opcional, p. ej. barbarus') : 'Primero el género'}
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            autoComplete="off"
+          />
+          <datalist id={speciesListId}>
+            {(hasGenus ? speciesOptions : []).map((name) => (
+              <option key={name} value={name} />
+            ))}
+          </datalist>
+        </label>
+      )}
     </div>
   )
 }
 
+// Nombres ya usados en registros y fichas de cría.
 async function loadKnownNames(): Promise<KnownNames> {
   const genera = new Set<string>()
   const species = new Map<string, string[]>()
-  await db.observations.each((o) => {
-    if (o.deleted || !o.genus) return
-    genera.add(o.genus)
-    if (!o.species) return
-    const key = o.genus.toLowerCase()
+  const add = (t: { genus?: string; species?: string; deleted?: boolean }) => {
+    if (t.deleted || !t.genus) return
+    genera.add(t.genus)
+    if (!t.species) return
+    const key = t.genus.toLowerCase()
     const list = species.get(key) ?? []
-    if (!list.includes(o.species)) list.push(o.species)
+    if (!list.includes(t.species)) list.push(t.species)
     species.set(key, list)
-  })
+  }
+  await db.observations.each(add)
+  await db.sheets.each(add)
   return { genera: [...genera], species }
 }

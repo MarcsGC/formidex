@@ -1,17 +1,21 @@
 // Motor de sincronización con Google Drive.
 //
 // El dispositivo trabaja siempre contra su base de datos local (IndexedDB) y la sincronización
-// copia los cambios en los dos sentidos. En Drive cada registro es un archivo JSON propio dentro
-// de Formidex/registros y cada foto son dos JPEG (tamaño completo y miniatura) en Formidex/fotos.
-// Si el mismo registro se cambia en dos dispositivos, gana el cambio con updatedAt más reciente.
+// copia los cambios en los dos sentidos. En Drive cada registro y cada ficha de cría es un archivo
+// JSON propio, dentro de Formidex/registros y Formidex/fichas, y cada foto son dos JPEG (tamaño
+// completo y miniatura) en Formidex/fotos. Si lo mismo se cambia en dos dispositivos, gana el
+// cambio con updatedAt más reciente.
 
-import type { FormidexDB } from '../db'
+import type { Table } from 'dexie'
+import type { CareSheet } from '../care'
+import type { FormidexDB, SyncFields } from '../db'
 import type { Observation, PhotoRef } from '../model'
 import { NotFoundError, type DriveApi, type DriveFileMeta } from './driveApi'
 
 export const FOLDER_MARKERS = {
   root: 'root',
   observations: 'observations',
+  sheets: 'sheets',
   photos: 'photos',
 } as const
 
@@ -35,20 +39,73 @@ export interface SyncReport {
 
 export interface DriveFolders {
   observations: string
+  sheets: string
   photos: string
 }
 
 type ProgressFn = (progress: SyncProgress) => void
 
+/** Lo que tienen en común los registros y las fichas para sincronizarse. */
+interface SyncedRecord {
+  id: string
+  updatedAt: string
+  deleted?: boolean
+  photos: PhotoRef[]
+}
+
+type LocalRecord<T> = T & SyncFields
+// Siempre se guardan registros completos, así que el tipo de inserción de Dexie no aporta nada aquí.
+type RecordTable<T> = Table<LocalRecord<T>, string, any>
+
+/** Cómo se guarda en Drive cada tipo de dato. */
+interface RecordKind<T extends SyncedRecord> {
+  table: (db: FormidexDB) => RecordTable<T>
+  fileName: (id: string) => string
+  /** appProperty con el id, para reconocer el archivo aunque cambie de nombre. */
+  idProperty: string
+  namePattern: RegExp
+  parse: (text: string) => T | null
+  downloading: string
+  uploading: string
+}
+
+const OBSERVATIONS: RecordKind<Observation> = {
+  table: (db) => db.observations,
+  fileName: (id) => `registro-${id}.json`,
+  idProperty: 'formidexObservation',
+  namePattern: /^registro-(.+)\.json$/,
+  parse: parseObservation,
+  downloading: 'Descargando registros',
+  uploading: 'Subiendo registros',
+}
+
+const SHEETS: RecordKind<CareSheet> = {
+  table: (db) => db.sheets,
+  fileName: (id) => `ficha-${id}.json`,
+  idProperty: 'formidexSheet',
+  namePattern: /^ficha-(.+)\.json$/,
+  parse: parseSheet,
+  downloading: 'Descargando fichas',
+  uploading: 'Subiendo fichas',
+}
+
 export async function runSync(db: FormidexDB, drive: DriveApi, onProgress: ProgressFn = () => {}): Promise<SyncReport> {
   onProgress({ phase: 'Preparando las carpetas de Drive' })
   const folders = await ensureFolders(db, drive)
   const trashed = await flushDeletions(db, drive)
-  const pulled = await pull(db, drive, folders, onProgress)
-  const { pushed, photosUploaded } = await push(db, drive, folders, onProgress)
+  onProgress({ phase: 'Buscando cambios en Drive' })
+  const pulled = (await pull(db, drive, folders.observations, OBSERVATIONS, onProgress)) + (await pull(db, drive, folders.sheets, SHEETS, onProgress))
+  const observations = await push(db, drive, folders.observations, folders.photos, OBSERVATIONS, onProgress)
+  const sheets = await push(db, drive, folders.sheets, folders.photos, SHEETS, onProgress)
   const thumbsDownloaded = await downloadMissingThumbs(db, drive, onProgress)
   await db.setMeta('lastSync', new Date().toISOString())
-  return { pulled, pushed, photosUploaded, thumbsDownloaded, trashed }
+  return {
+    pulled,
+    pushed: observations.pushed + sheets.pushed,
+    photosUploaded: observations.photosUploaded + sheets.photosUploaded,
+    thumbsDownloaded,
+    trashed,
+  }
 }
 
 /** Descarga la foto a tamaño completo si este dispositivo aún no la tiene. */
@@ -64,35 +121,48 @@ export async function fetchFullPhoto(db: FormidexDB, drive: DriveApi, photoId: s
 
 async function ensureFolders(db: FormidexDB, drive: DriveApi): Promise<DriveFolders> {
   let observations = await drive.findFolder(FOLDER_MARKERS.observations)
+  let sheets = await drive.findFolder(FOLDER_MARKERS.sheets)
   let photos = await drive.findFolder(FOLDER_MARKERS.photos)
-  if (!observations || !photos) {
+  if (!observations || !sheets || !photos) {
     const root = (await drive.findFolder(FOLDER_MARKERS.root)) ?? (await drive.createFolder('Formidex', FOLDER_MARKERS.root))
     observations ??= await drive.createFolder('registros', FOLDER_MARKERS.observations, root)
+    sheets ??= await drive.createFolder('fichas', FOLDER_MARKERS.sheets, root)
     photos ??= await drive.createFolder('fotos', FOLDER_MARKERS.photos, root)
   }
-  const folders: DriveFolders = { observations, photos }
-  const previous = await db.getMeta<DriveFolders>('driveFolders')
+  const folders: DriveFolders = { observations, sheets, photos }
+  const previous = await db.getMeta<Partial<DriveFolders>>('driveFolders')
   if (previous && (previous.observations !== observations || previous.photos !== photos)) {
     // Otra cuenta de Google o las carpetas se borraron: se vuelve a subir todo lo de este dispositivo.
     await forgetRemoteState(db)
+  } else if (previous?.sheets && previous.sheets !== sheets) {
+    // Solo cambió la carpeta de fichas (por ejemplo, dos dispositivos la crearon a la vez).
+    await forgetRemoteFiles(db.sheets)
   }
   await db.setMeta('driveFolders', folders)
   return folders
 }
 
 async function forgetRemoteState(db: FormidexDB): Promise<void> {
-  await db.transaction('rw', db.observations, db.photos, db.pendingDeletions, async () => {
-    await db.observations.toCollection().modify((o) => {
-      delete o.driveFileId
-      delete o.remoteModifiedTime
-      o.photos = o.photos.map(({ id, width, height }) => ({ id, width, height }))
-      o.dirty = o.deleted ? 0 : 1
-    })
+  await db.transaction('rw', db.observations, db.sheets, db.photos, db.pendingDeletions, async () => {
+    for (const table of [db.observations, db.sheets] as RecordTable<SyncedRecord>[]) {
+      await table.toCollection().modify((record) => {
+        record.photos = record.photos.map(({ id, width, height }) => ({ id, width, height }))
+      })
+      await forgetRemoteFiles(table)
+    }
     await db.photos.toCollection().modify((p) => {
       delete p.driveFullId
       delete p.driveThumbId
     })
     await db.pendingDeletions.clear()
+  })
+}
+
+async function forgetRemoteFiles(table: RecordTable<SyncedRecord>): Promise<void> {
+  await table.toCollection().modify((record) => {
+    delete record.driveFileId
+    delete record.remoteModifiedTime
+    record.dirty = record.deleted ? 0 : 1
   })
 }
 
@@ -105,21 +175,27 @@ async function flushDeletions(db: FormidexDB, drive: DriveApi): Promise<number> 
   return pending.length
 }
 
-async function pull(db: FormidexDB, drive: DriveApi, folders: DriveFolders, onProgress: ProgressFn): Promise<number> {
-  onProgress({ phase: 'Buscando cambios en Drive' })
-  const files = await drive.listFiles(folders.observations)
+async function pull<T extends SyncedRecord>(
+  db: FormidexDB,
+  drive: DriveApi,
+  folderId: string,
+  kind: RecordKind<T>,
+  onProgress: ProgressFn,
+): Promise<number> {
+  const table = kind.table(db)
+  const files = await drive.listFiles(folderId)
 
   // Si por algún fallo hay dos archivos del mismo registro, manda el más reciente.
   const latest = new Map<string, DriveFileMeta>()
   for (const file of files) {
-    const id = observationIdOf(file)
+    const id = file.appProperties?.[kind.idProperty] ?? kind.namePattern.exec(file.name)?.[1]
     if (!id) continue
     const previous = latest.get(id)
     if (!previous || previous.modifiedTime < file.modifiedTime) latest.set(id, file)
   }
 
   const ids = [...latest.keys()]
-  const locals = await db.observations.bulkGet(ids)
+  const locals = await table.bulkGet(ids)
   const changed = ids
     .map((id, i) => ({ id, file: latest.get(id)!, local: locals[i] }))
     .filter(({ file, local }) => !(local && local.driveFileId === file.id && local.remoteModifiedTime === file.modifiedTime))
@@ -127,20 +203,33 @@ async function pull(db: FormidexDB, drive: DriveApi, folders: DriveFolders, onPr
   let applied = 0
   let done = 0
   await forEachLimited(changed, DOWNLOAD_CONCURRENCY, async ({ id, file }) => {
-    onProgress({ phase: 'Descargando registros', done: done++, total: changed.length })
-    const remote = parseObservation(await drive.downloadText(file.id))
+    onProgress({ phase: kind.downloading, done: done++, total: changed.length })
+    const remote = kind.parse(await drive.downloadText(file.id))
     if (!remote || remote.id !== id) return
-    if (await applyRemote(db, remote, file)) applied++
+    if (await applyRemote(db, table, remote, file)) applied++
   })
   return applied
 }
 
-async function applyRemote(db: FormidexDB, remote: Observation, file: DriveFileMeta): Promise<boolean> {
-  return db.transaction('rw', db.observations, db.photos, async () => {
-    const local = await db.observations.get(remote.id)
-    if (local && local.dirty === 1 && local.updatedAt >= remote.updatedAt) {
+async function applyRemote<T extends SyncedRecord>(
+  db: FormidexDB,
+  table: RecordTable<T>,
+  remote: T,
+  file: DriveFileMeta,
+): Promise<boolean> {
+  return db.transaction('rw', table, db.photos, db.pendingDeletions, async () => {
+    const local = await table.get(remote.id)
+    // Un borrado no se deshace con una copia anterior, como la que vuelve a subir un dispositivo que
+    // no llegó a verlo porque se borró la carpeta en Drive: se vuelve a subir el borrado.
+    const staleCopy = local?.deleted === true && !remote.deleted && local.updatedAt > remote.updatedAt
+    if (local && (staleCopy || (local.dirty === 1 && local.updatedAt >= remote.updatedAt))) {
       // El cambio local es más reciente: se queda y se sube después.
-      await db.observations.update(remote.id, { driveFileId: file.id, remoteModifiedTime: file.modifiedTime })
+      if (staleCopy) {
+        for (const ref of remote.photos) {
+          for (const driveFileId of [ref.driveFullId, ref.driveThumbId]) if (driveFileId) await db.pendingDeletions.put({ driveFileId })
+        }
+      }
+      await table.put({ ...local, dirty: 1, driveFileId: file.id, remoteModifiedTime: file.modifiedTime })
       return false
     }
 
@@ -164,7 +253,7 @@ async function applyRemote(db: FormidexDB, remote: Observation, file: DriveFileM
       }
     }
 
-    await db.observations.put({
+    await table.put({
       ...remote,
       photos: remotePhotos,
       dirty: 0,
@@ -175,35 +264,37 @@ async function applyRemote(db: FormidexDB, remote: Observation, file: DriveFileM
   })
 }
 
-async function push(
+async function push<T extends SyncedRecord>(
   db: FormidexDB,
   drive: DriveApi,
-  folders: DriveFolders,
+  folderId: string,
+  photosFolderId: string,
+  kind: RecordKind<T>,
   onProgress: ProgressFn,
 ): Promise<{ pushed: number; photosUploaded: number }> {
-  const dirty = await db.observations.where('dirty').equals(1).toArray()
+  const table = kind.table(db)
+  const dirty = await table.where('dirty').equals(1).toArray()
   let pushed = 0
   let photosUploaded = 0
 
-  for (const [i, obs] of dirty.entries()) {
-    onProgress({ phase: 'Subiendo registros', done: i, total: dirty.length })
+  for (const [i, record] of dirty.entries()) {
+    onProgress({ phase: kind.uploading, done: i, total: dirty.length })
 
-    if (obs.deleted && !obs.driveFileId) {
+    if (record.deleted && !record.driveFileId) {
       // Se creó y se borró sin llegar a subirse: no hay nada que avisar a otros dispositivos.
-      await db.observations.delete(obs.id)
+      await table.delete(record.id)
       continue
     }
 
     const refs: PhotoRef[] = []
-    for (const ref of obs.photos) {
-      const result = await ensurePhotoUploaded(db, drive, folders.photos, ref)
+    for (const ref of record.photos) {
+      const result = await ensurePhotoUploaded(db, drive, photosFolderId, ref)
       if (result.uploaded) photosUploaded++
       if (result.ref) refs.push(result.ref)
     }
 
-    const { dirty: _dirty, driveFileId, remoteModifiedTime: _remote, ...plain } = obs
-    const payload: Observation = { ...plain, photos: refs }
-    const body = JSON.stringify(payload)
+    const { dirty: _dirty, driveFileId, remoteModifiedTime: _remote, ...plain } = record
+    const body = JSON.stringify({ ...plain, photos: refs })
 
     let meta: DriveFileMeta | undefined
     if (driveFileId) {
@@ -214,27 +305,22 @@ async function push(
       }
     }
     meta ??= await drive.createFile({
-      name: `registro-${obs.id}.json`,
-      parentId: folders.observations,
+      name: kind.fileName(record.id),
+      parentId: folderId,
       mimeType: JSON_MIME,
-      appProperties: { formidexObservation: obs.id },
+      appProperties: { [kind.idProperty]: record.id },
       body,
     })
 
     const uploaded = meta
-    await db.transaction('rw', db.observations, async () => {
-      const current = await db.observations.get(obs.id)
+    await db.transaction('rw', table, async () => {
+      const current = await table.get(record.id)
       if (!current) return
-      if (current.updatedAt === obs.updatedAt) {
-        await db.observations.update(obs.id, {
-          photos: refs,
-          dirty: 0,
-          driveFileId: uploaded.id,
-          remoteModifiedTime: uploaded.modifiedTime,
-        })
+      if (current.updatedAt === record.updatedAt) {
+        await table.put({ ...current, photos: refs, dirty: 0, driveFileId: uploaded.id, remoteModifiedTime: uploaded.modifiedTime })
       } else {
         // Se editó mientras se subía: sigue pendiente para la próxima vez.
-        await db.observations.update(obs.id, { driveFileId: uploaded.id, remoteModifiedTime: uploaded.modifiedTime })
+        await table.put({ ...current, driveFileId: uploaded.id, remoteModifiedTime: uploaded.modifiedTime })
       }
     })
     pushed++
@@ -306,20 +392,19 @@ async function downloadMissingThumbs(db: FormidexDB, drive: DriveApi, onProgress
   return downloaded
 }
 
-function observationIdOf(file: DriveFileMeta): string | undefined {
-  return file.appProperties?.formidexObservation ?? /^registro-(.+)\.json$/.exec(file.name)?.[1]
-}
-
-export function parseObservation(text: string): Observation | null {
-  let data: unknown
+function parseJsonObject(text: string): Record<string, unknown> | null {
   try {
-    data = JSON.parse(text)
+    const data: unknown = JSON.parse(text)
+    return data && typeof data === 'object' && !Array.isArray(data) ? (data as Record<string, unknown>) : null
   } catch {
     return null
   }
-  if (!data || typeof data !== 'object') return null
-  const o = data as Partial<Observation>
+}
+
+export function parseObservation(text: string): Observation | null {
+  const o = parseJsonObject(text) as Partial<Observation> | null
   if (
+    !o ||
     typeof o.id !== 'string' ||
     typeof o.lat !== 'number' ||
     typeof o.lng !== 'number' ||
@@ -333,6 +418,24 @@ export function parseObservation(text: string): Observation | null {
     ...(o as Observation),
     locationSource: o.locationSource ?? 'map',
     createdAt: o.createdAt ?? o.updatedAt,
+  }
+}
+
+export function parseSheet(text: string): CareSheet | null {
+  const s = parseJsonObject(text) as Partial<CareSheet> | null
+  if (
+    !s ||
+    typeof s.id !== 'string' ||
+    typeof s.updatedAt !== 'string' ||
+    (s.level !== 'genus' && s.level !== 'species' && s.level !== 'colony')
+  ) {
+    return null
+  }
+  return {
+    ...(s as CareSheet),
+    params: s.params && typeof s.params === 'object' ? s.params : {},
+    photos: Array.isArray(s.photos) ? s.photos : [],
+    createdAt: s.createdAt ?? s.updatedAt,
   }
 }
 
