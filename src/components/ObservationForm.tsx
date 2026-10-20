@@ -1,11 +1,10 @@
-import { useEffect, useRef, useState, type ChangeEvent } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { deleteObservation, saveObservation, type PhotoItem } from '../data'
 import { db } from '../db'
 import { formatDateTime, fromLocalInputValue, normalizeTaxon, toLocalInputValue } from '../model'
-import { processPhoto } from '../photos'
+import type { ProcessedPhoto } from '../photos'
 import { LocationPicker, type PickedLocation } from './LocationPicker'
-import { PhotoThumb } from './PhotoThumb'
-import { PhotoViewer } from './PhotoViewer'
+import { PhotoField } from './PhotoField'
 import { TaxonFields } from './TaxonFields'
 
 export type FormTarget = { mode: 'new'; preset?: { lat: number; lng: number } } | { mode: 'edit'; id: string }
@@ -15,8 +14,6 @@ interface ObservationFormProps {
   onClose: () => void
   onSaved: (id: string) => void
 }
-
-const isTouchDevice = typeof window !== 'undefined' && window.matchMedia?.('(pointer: coarse)').matches
 
 export function ObservationForm({ target, onClose, onSaved }: ObservationFormProps) {
   const editingId = target.mode === 'edit' ? target.id : undefined
@@ -30,11 +27,10 @@ export function ObservationForm({ target, onClose, onSaved }: ObservationFormPro
   const [species, setSpecies] = useState('')
   const [observedAt, setObservedAt] = useState(() => toLocalInputValue(new Date().toISOString()))
   const [notes, setNotes] = useState('')
-  const [processing, setProcessing] = useState(0)
+  const [processing, setProcessing] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [meta, setMeta] = useState<{ createdAt: string; pending: boolean } | null>(null)
-  const [viewing, setViewing] = useState<PhotoItem | null>(null)
   const changed = useRef(false)
   const locationChosen = useRef(Boolean(preset))
   const dateChosen = useRef(false)
@@ -71,46 +67,26 @@ export function ObservationForm({ target, onClose, onSaved }: ObservationFormPro
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !viewing) close()
+      if (event.key === 'Escape') close()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   })
 
-  async function addFiles(event: ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(event.target.files ?? [])
-    event.target.value = ''
-    if (files.length === 0) return
-    changed.current = true
-    setError(null)
-    for (const file of files) {
-      setProcessing((n) => n + 1)
-      try {
-        const photo = await processPhoto(file)
-        setItems((prev) => [...prev, { kind: 'new', photo }])
-        const { lat, lng, takenAt } = photo.exif
-        if (lat !== undefined && lng !== undefined) {
-          setPhotoLocation((prev) => prev ?? { lat, lng })
-          if (!locationChosen.current) {
-            locationChosen.current = true
-            setLocation({ lat, lng, source: 'exif' })
-          }
-        }
-        if (takenAt && !dateChosen.current) {
-          dateChosen.current = true
-          setObservedAt(toLocalInputValue(takenAt))
-        }
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
-      } finally {
-        setProcessing((n) => n - 1)
+  // Si la foto guarda dónde y cuándo se hizo, rellena la ubicación y la fecha si aún no se han elegido.
+  function applyPhotoData(photo: ProcessedPhoto) {
+    const { lat, lng, takenAt } = photo.exif
+    if (lat !== undefined && lng !== undefined) {
+      setPhotoLocation((prev) => prev ?? { lat, lng })
+      if (!locationChosen.current) {
+        locationChosen.current = true
+        setLocation({ lat, lng, source: 'exif' })
       }
     }
-  }
-
-  function removeItem(index: number) {
-    changed.current = true
-    setItems((prev) => prev.filter((_, i) => i !== index))
+    if (takenAt && !dateChosen.current) {
+      dateChosen.current = true
+      setObservedAt(toLocalInputValue(takenAt))
+    }
   }
 
   async function save() {
@@ -156,7 +132,7 @@ export function ObservationForm({ target, onClose, onSaved }: ObservationFormPro
             Cancelar
           </button>
           <h2 id="form-title">{editingId ? 'Editar registro' : 'Nuevo registro'}</h2>
-          <button type="button" className="button button-small" onClick={save} disabled={saving || processing > 0 || loading}>
+          <button type="button" className="button button-small" onClick={save} disabled={saving || processing || loading}>
             {saving ? 'Guardando…' : 'Guardar'}
           </button>
         </header>
@@ -169,35 +145,14 @@ export function ObservationForm({ target, onClose, onSaved }: ObservationFormPro
           <div className="sheet-body">
             <section className="form-section">
               <h3>Fotos</h3>
-              <div className="photo-grid">
-                {items.map((item, index) => (
-                  <div className="photo-cell" key={item.kind === 'existing' ? item.ref.id : item.photo.id}>
-                    <button type="button" className="photo-open" onClick={() => setViewing(item)} aria-label="Ver foto">
-                      {item.kind === 'existing' ? <PhotoThumb photoId={item.ref.id} /> : <PhotoThumb blob={item.photo.thumb} />}
-                    </button>
-                    <button type="button" className="photo-remove" onClick={() => removeItem(index)} aria-label="Quitar foto">
-                      ×
-                    </button>
-                  </div>
-                ))}
-                {processing > 0 && (
-                  <div className="photo-cell photo-processing" aria-label="Preparando foto">
-                    <span className="spinner" />
-                  </div>
-                )}
-                {isTouchDevice && (
-                  <label className="photo-add">
-                    <span aria-hidden="true">📷</span>
-                    <span>Hacer foto</span>
-                    <input type="file" accept="image/*" capture="environment" onChange={addFiles} hidden />
-                  </label>
-                )}
-                <label className="photo-add">
-                  <span aria-hidden="true">🖼️</span>
-                  <span>{isTouchDevice ? 'Galería' : 'Añadir fotos'}</span>
-                  <input type="file" accept="image/*" multiple onChange={addFiles} hidden />
-                </label>
-              </div>
+              <PhotoField
+                items={items}
+                setItems={setItems}
+                onAdded={applyPhotoData}
+                onChanged={() => (changed.current = true)}
+                onError={setError}
+                onBusyChange={setProcessing}
+              />
               <p className="hint">Si la foto guarda dónde y cuándo se hizo, se rellenan solos la ubicación y la fecha.</p>
             </section>
 
@@ -277,14 +232,6 @@ export function ObservationForm({ target, onClose, onSaved }: ObservationFormPro
           </div>
         )}
       </div>
-
-      {viewing && (
-        <PhotoViewer
-          blob={viewing.kind === 'new' ? viewing.photo.full : undefined}
-          photoId={viewing.kind === 'existing' ? viewing.ref.id : undefined}
-          onClose={() => setViewing(null)}
-        />
-      )}
     </div>
   )
 }

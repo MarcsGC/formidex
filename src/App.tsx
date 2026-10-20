@@ -1,17 +1,23 @@
 import { useCallback, useEffect, useState } from 'react'
+import { CareDetail } from './components/CareDetail'
+import { CareForm, type CareFormTarget } from './components/CareForm'
+import { CareView } from './components/CareView'
 import { MapView } from './components/MapView'
 import { ObservationForm, type FormTarget } from './components/ObservationForm'
 import { ObservationList } from './components/ObservationList'
 import { SettingsView } from './components/SettingsView'
 import { SyncBadge } from './components/SyncBadge'
 import { requestPersistentStorage } from './data'
+import { useRoute, type Route } from './route'
 import { startSyncService } from './sync/controller'
 
-type Tab = 'map' | 'list' | 'settings'
+type Tab = Route['tab']
 
 const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: 'map', label: 'Mapa', icon: 'M9 4 3 6v14l6-2 6 2 6-2V4l-6 2-6-2zM9 4v14M15 6v14' },
   { id: 'list', label: 'Registros', icon: 'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01' },
+  // Un tubo de ensayo, donde empiezan muchas colonias.
+  { id: 'care', label: 'Cría', icon: 'M8.5 3h7M10 3v14.5a2 2 0 0 0 4 0V3M10 12h4' },
   {
     id: 'settings',
     label: 'Ajustes',
@@ -20,8 +26,10 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
 ]
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>('map')
+  const [route, navigate, back] = useRoute()
+  const tab = route.tab
   const [form, setForm] = useState<FormTarget | null>(null)
+  const [careForm, setCareForm] = useState<CareFormTarget | null>(null)
   const [focusId, setFocusId] = useState<string | null>(null)
 
   useEffect(() => {
@@ -33,10 +41,15 @@ export default function App() {
   const openEdit = useCallback((id: string) => setForm({ mode: 'edit', id }), [])
   const closeForm = useCallback(() => setForm(null), [])
   const clearFocus = useCallback(() => setFocusId(null), [])
-  const showOnMap = useCallback((id: string) => {
-    setFocusId(id)
-    setTab('map')
-  }, [])
+  const setTab = useCallback((next: Tab) => navigate({ tab: next }, { replace: true }), [navigate])
+  const showOnMap = useCallback(
+    (id: string) => {
+      setFocusId(id)
+      setTab('map')
+    },
+    [setTab],
+  )
+  const openSheet = useCallback((id: string) => navigate({ tab: 'care', sheetId: id }), [navigate])
 
   return (
     <div className="app">
@@ -51,6 +64,19 @@ export default function App() {
       <main className="app-main">
         {tab === 'map' && <MapView focusId={focusId} onFocusHandled={clearFocus} onNew={openNew} onEdit={openEdit} />}
         {tab === 'list' && <ObservationList onEdit={openEdit} onShowOnMap={showOnMap} onNew={() => openNew()} />}
+        {route.tab === 'care' &&
+          (route.sheetId ? (
+            <CareDetail
+              key={route.sheetId}
+              id={route.sheetId}
+              onBack={() => back({ tab: 'care' })}
+              onOpen={openSheet}
+              onEdit={(id) => setCareForm({ mode: 'edit', id })}
+              onNew={setCareForm}
+            />
+          ) : (
+            <CareView onOpen={openSheet} onNew={setCareForm} />
+          ))}
         {tab === 'settings' && <SettingsView />}
       </main>
 
@@ -70,6 +96,26 @@ export default function App() {
           </button>
         ))}
       </nav>
+
+      {careForm && (
+        <CareForm
+          key={careForm.mode === 'edit' ? careForm.id : 'new'}
+          target={careForm}
+          onClose={() => setCareForm(null)}
+          onSaved={(id, created) => {
+            setCareForm(null)
+            if (created) openSheet(id)
+          }}
+          onDeleted={() => {
+            setCareForm(null)
+            back({ tab: 'care' })
+          }}
+          onOpenExisting={(id) => {
+            setCareForm(null)
+            openSheet(id)
+          }}
+        />
+      )}
 
       {form && (
         <ObservationForm

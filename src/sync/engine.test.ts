@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('./controller', () => ({ scheduleSync: () => {} }))
 
-import { deleteObservation, saveObservation, type ObservationInput } from '../data'
+import { deleteObservation, deleteSheet, saveObservation, saveSheet, type ObservationInput, type SheetInput } from '../data'
 import { FormidexDB } from '../db'
 import type { ProcessedPhoto } from '../photos'
 import { fetchFullPhoto, runSync } from './engine'
@@ -33,6 +33,15 @@ function input(overrides: Partial<ObservationInput> = {}): ObservationInput {
     observedAt: '2026-05-01T10:00:00.000Z',
     genus: 'Messor',
     species: 'barbarus',
+    ...overrides,
+  }
+}
+
+function sheet(overrides: Partial<SheetInput> = {}): SheetInput {
+  return {
+    level: 'genus',
+    genus: 'Messor',
+    params: { escape: 'baja', carbs: [{ name: 'Semillas de alpiste', liking: 'mucho' }] },
     ...overrides,
   }
 }
@@ -195,10 +204,101 @@ describe('sincronización con Google Drive', () => {
     expect(await b.observations.count()).toBe(1)
   })
 
-  it('las dos primeras sincronizaciones crean una sola carpeta Formidex', async () => {
+  it('las dos primeras sincronizaciones crean una sola carpeta Formidex con sus tres subcarpetas', async () => {
     await runSync(a, drive)
     await runSync(b, drive)
 
-    expect(drive.calls.createFolder).toBe(3)
+    expect(drive.calls.createFolder).toBe(4)
+  })
+})
+
+describe('sincronización de las fichas de cría', () => {
+  it('sube las fichas a su carpeta y llegan al otro dispositivo con sus fotos', async () => {
+    const genusId = await saveSheet(undefined, sheet(), [], a)
+    const colonyId = await saveSheet(
+      undefined,
+      sheet({ level: 'colony', species: 'barbarus', name: 'Barbarus 1', startedAt: '2026-03-12', params: { escape: 'alta' } }),
+      [{ kind: 'new', photo: photo('colonia') }],
+      a,
+    )
+
+    expect(await runSync(a, drive)).toMatchObject({ pushed: 2, photosUploaded: 1 })
+    const folder = (await drive.findFolder('sheets'))!
+    expect((await drive.listFiles(folder)).map((f) => f.appProperties?.formidexSheet).sort()).toEqual([colonyId, genusId].sort())
+
+    expect(await runSync(b, drive)).toMatchObject({ pulled: 2, thumbsDownloaded: 1 })
+    expect(await b.sheets.get(genusId)).toMatchObject({ level: 'genus', params: { escape: 'baja' }, dirty: 0 })
+    const colony = await b.sheets.get(colonyId)
+    expect(colony).toMatchObject({ name: 'Barbarus 1', species: 'barbarus', startedAt: '2026-03-12' })
+    expect(await (await b.photos.get(colony!.photos[0].id))?.thumb?.text()).toBe('thumb-colonia')
+  })
+
+  it('los cambios y los borrados de fichas llegan al otro dispositivo', async () => {
+    const id = await saveSheet(undefined, sheet(), [{ kind: 'new', photo: photo('1') }], a)
+    await runSync(a, drive)
+    await runSync(b, drive)
+
+    await saveSheet(id, sheet({ params: { escape: 'media' }, notes: 'Desde B' }), [], b)
+    await runSync(b, drive)
+    await runSync(a, drive)
+    expect(await a.sheets.get(id)).toMatchObject({ params: { escape: 'media' }, notes: 'Desde B', photos: [] })
+
+    await deleteSheet(id, a)
+    await runSync(a, drive)
+    await runSync(b, drive)
+    expect(await b.sheets.get(id)).toMatchObject({ deleted: true })
+    expect(drive.visible(/\.jpg$/)).toHaveLength(0)
+  })
+
+  it('un dispositivo que ya sincronizaba sin fichas solo crea su carpeta, sin volver a subir nada', async () => {
+    await saveObservation(undefined, input(), [{ kind: 'new', photo: photo('1') }], a)
+    await runSync(a, drive)
+    // Así quedaba el dispositivo antes de que existieran las fichas.
+    const sheetsFolder = (await drive.findFolder('sheets'))!
+    await drive.trashFile(sheetsFolder)
+    const { observations, photos } = (await a.getMeta<{ observations: string; photos: string }>('driveFolders'))!
+    await a.setMeta('driveFolders', { observations, photos })
+
+    const report = await runSync(a, drive)
+
+    expect(report).toMatchObject({ pushed: 0, photosUploaded: 0 })
+    const newFolder = await drive.findFolder('sheets')
+    expect(newFolder).toBeTruthy()
+    expect(newFolder).not.toBe(sheetsFolder)
+    expect(drive.visible(/^registro-/)).toHaveLength(1)
+  })
+
+  it('un borrado no se deshace si otro dispositivo vuelve a subir la ficha después de borrar las carpetas en Drive', async () => {
+    const id = await saveSheet(undefined, sheet(), [{ kind: 'new', photo: photo('1') }], a)
+    await runSync(a, drive)
+    await runSync(b, drive)
+    await deleteSheet(id, a)
+    await runSync(a, drive)
+
+    // Las carpetas se borran en Drive antes de que B se entere del borrado, y B vuelve a subir la ficha.
+    for (const marker of ['sheets', 'photos']) await drive.trashFile((await drive.findFolder(marker))!)
+    await runSync(a, drive)
+    await runSync(b, drive)
+    expect(drive.visible(/\.jpg$/)).toHaveLength(2)
+
+    await runSync(a, drive)
+    expect(await a.sheets.get(id)).toMatchObject({ deleted: true })
+    await runSync(b, drive)
+    expect(await b.sheets.get(id)).toMatchObject({ deleted: true })
+    await runSync(a, drive)
+    expect(drive.visible(/\.jpg$/)).toHaveLength(0)
+  })
+
+  it('si cambia solo la carpeta de fichas, vuelve a subir solo las fichas', async () => {
+    await saveObservation(undefined, input(), [{ kind: 'new', photo: photo('1') }], a)
+    await saveSheet(undefined, sheet(), [], a)
+    await runSync(a, drive)
+    await drive.trashFile((await drive.findFolder('sheets'))!)
+
+    const report = await runSync(a, drive)
+
+    expect(report).toMatchObject({ pushed: 1, photosUploaded: 0 })
+    expect(await drive.listFiles((await drive.findFolder('sheets'))!)).toHaveLength(1)
+    expect(drive.visible(/^registro-/)).toHaveLength(1)
   })
 })
