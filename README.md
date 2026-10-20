@@ -49,17 +49,22 @@ registro o la misma ficha se cambia en dos dispositivos, se queda el cambio más
 En iPhone conviene **añadir la app a la pantalla de inicio**: Safari puede borrar los datos de una web que no visitas en
 una semana, pero no los de una app instalada. Lo que ya está en Drive no se pierde en ningún caso.
 
-## Configurar Google Drive (una sola vez)
+## Google Drive
+
+La app usa su propio cliente OAuth de Google Cloud, cuyo ID está en `.env.production`. Si hubiera que crear otro, por
+ejemplo para publicarla en otra dirección:
 
 1. Entra en [Google Cloud Console](https://console.cloud.google.com/) y crea un proyecto (por ejemplo, «Formidex»).
 2. En **APIs y servicios → Biblioteca**, activa **Google Drive API**.
 3. En **Google Auth Platform** (pantalla de consentimiento), crea la configuración: nombre «Formidex», tu correo y
    público **Externo**. En **Público**, añade tu cuenta de Google como usuario de prueba.
 4. En **Clientes**, crea un cliente de tipo **Aplicación web** con estos **Orígenes de JavaScript autorizados**:
-   - `https://marcsgc.github.io`
+   - `https://marcsgc.github.io` (o la dirección donde se publique)
    - `http://localhost:5173` (solo para desarrollo)
 5. Copia el **ID de cliente** (termina en `.apps.googleusercontent.com`) y ponlo en `.env.production`:
-   `VITE_GOOGLE_CLIENT_ID=...`. Mientras tanto también se puede pegar en **Ajustes → Configuración avanzada** de la app.
+   `VITE_GOOGLE_CLIENT_ID=...`. En un dispositivo también se puede pegar otro en **Ajustes → Configuración avanzada**,
+   que tiene prioridad sobre el de la app. En desarrollo (`npm run dev`) no se lee `.env.production`, así que el ID se
+   pega ahí.
 
 ## Publicar en GitHub Pages
 
